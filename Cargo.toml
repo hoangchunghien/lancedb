@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "rust/lancedb/cli",
     "rust/lancedb",
     "nodejs",
     "python",
