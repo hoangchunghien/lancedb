@@ -111,13 +111,21 @@ mod tests {
         )
         .await
         .unwrap();
-        connection.list_tables(Default::default()).await.unwrap();
+        connection
+            .list_tables(&[], Default::default())
+            .next_page()
+            .await
+            .unwrap();
         let headers = headers_rx.try_recv().unwrap();
         assert_eq!(headers["authorization"], "Bearer test-token");
         assert_eq!(headers["x-lancedb-credential-type"], "oidc");
         assert!(!headers.contains_key("x-api-key"));
         std::fs::write(path, "replacement-token").unwrap();
-        connection.list_tables(Default::default()).await.unwrap();
+        connection
+            .list_tables(&[], Default::default())
+            .next_page()
+            .await
+            .unwrap();
         let headers = headers_rx.try_recv().unwrap();
         assert_eq!(headers["authorization"], "Bearer replacement-token");
         assert!(!headers.contains_key("x-api-key"));

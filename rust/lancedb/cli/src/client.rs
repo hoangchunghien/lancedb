@@ -11,6 +11,8 @@ use crate::sql_executor::{SqlQueryExecutor, SqlResult};
 use anyhow::{anyhow, Result};
 use arrow_schema::Schema;
 use directories::ProjectDirs;
+use futures::TryStreamExt;
+use lancedb::listing::ListingOptions;
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
@@ -786,12 +788,9 @@ where
             .await
             .map_err(|e| anyhow!("Failed to connect to LanceDB: {}", e))?;
 
-        let list_one = lance_namespace::models::ListTablesRequest {
-            limit: Some(1),
-            ..Default::default()
-        };
         let http_err = connection
-            .list_tables(list_one)
+            .list_tables(&[], ListingOptions::default().page_limit(1))
+            .next_page()
             .await
             .err()
             .map(anyhow::Error::from);
@@ -818,28 +817,11 @@ where
 
     /// Fetch all table names with pagination
     async fn table_names(connection: &lancedb::Connection) -> Result<Vec<String>> {
-        const PAGE_SIZE: i32 = 100;
-        let mut all_tables = Vec::new();
-        let mut page_token: Option<String> = None;
-
-        loop {
-            let page = connection
-                .list_tables(lance_namespace::models::ListTablesRequest {
-                    limit: Some(PAGE_SIZE),
-                    page_token: page_token.clone(),
-                    ..Default::default()
-                })
-                .await
-                .map_err(|e| anyhow!("Failed to list tables: {}", e))?;
-
-            all_tables.extend(page.tables);
-
-            // A short page can still be followed by more, so the token is what ends the walk.
-            page_token = page.page_token.filter(|token| !token.is_empty());
-            if page_token.is_none() {
-                break;
-            }
-        }
+        let mut all_tables: Vec<String> = connection
+            .list_tables(&[], ListingOptions::default().page_limit(100))
+            .try_collect()
+            .await
+            .map_err(|e| anyhow!("Failed to list tables: {}", e))?;
 
         // The listing resumes from the store's own cursor, so its pages arrive in key order
         // rather than name order. Callers here -- `\d`, `\dt`, and completion -- present the
@@ -1714,6 +1696,38 @@ mod tests {
     use crate::sql_executor::SqlResult;
 
     #[tokio::test]
+    async fn table_names_follows_short_and_empty_pages_and_sorts() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().fallback(
+            |axum::extract::Query(query): axum::extract::Query<
+                std::collections::HashMap<String, String>,
+            >| async move {
+                assert_eq!(query.get("limit").map(String::as_str), Some("100"));
+                let page = match query.get("page_token").map(String::as_str) {
+                    None => serde_json::json!({"tables": ["zebra"], "page_token": "empty"}),
+                    Some("empty") => serde_json::json!({"tables": [], "page_token": "last"}),
+                    Some("last") => serde_json::json!({"tables": ["apple"], "page_token": ""}),
+                    token => panic!("unexpected page token: {token:?}"),
+                };
+                axum::Json(page)
+            },
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let connection = lancedb::connect("db://test")
+            .api_key("test")
+            .region("self-hosted")
+            .host_override(&endpoint)
+            .execute()
+            .await
+            .unwrap();
+
+        let tables = super::LanceDBClient::<super::SdkSqlExecutor>::table_names(&connection).await;
+        server.abort();
+        assert_eq!(tables.unwrap(), ["apple", "zebra"]);
+    }
+
+    #[tokio::test]
     async fn http_connection_failure_preserves_status() {
         for status in [
             axum::http::StatusCode::UNAUTHORIZED,
@@ -1731,10 +1745,11 @@ mod tests {
                 .await
                 .unwrap();
             let error = connection
-                .list_tables(lance_namespace::models::ListTablesRequest {
-                    limit: Some(1),
-                    ..Default::default()
-                })
+                .list_tables(
+                    &[],
+                    lancedb::listing::ListingOptions::default().page_limit(1),
+                )
+                .next_page()
                 .await
                 .unwrap_err();
             server.abort();

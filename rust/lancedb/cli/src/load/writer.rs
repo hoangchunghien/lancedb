@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result};
 use arrow_array::RecordBatchIterator;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use lancedb::index::scalar::FtsIndexBuilder;
 use lancedb::index::vector::IvfPqIndexBuilder;
@@ -314,7 +314,10 @@ pub async fn load_to_lancedb(
         .context("Failed to connect to LanceDB")?;
 
     // Check if table exists
-    let table_names = db.list_tables(Default::default()).await?.tables;
+    let table_names: Vec<String> = db
+        .list_tables(&[], Default::default())
+        .try_collect()
+        .await?;
     if table_names.contains(&args.table) {
         if args.overwrite {
             info!("Dropping existing table '{}'", args.table);
