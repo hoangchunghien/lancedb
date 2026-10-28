@@ -49,9 +49,6 @@ pub(crate) fn lancedb_client_config(
     Some(config)
 }
 
-pub mod job;
-pub mod job_children;
-
 static BUILD_VERSION: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 /// Set the version displayed by shared command handlers when embedded in another binary.
 pub fn set_build_version(version: &'static str) {

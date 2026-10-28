@@ -14,7 +14,7 @@ fn no_arguments_print_help_without_creating_configuration() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("Usage:"));
-    for command in ["auth", "acl", "profile", "sql", "job", "load"] {
+    for command in ["auth", "acl", "profile", "sql", "load"] {
         assert!(stdout.contains(command));
     }
     assert!(!stdout.contains("secret-that-must-not-appear"));
@@ -26,6 +26,8 @@ fn excluded_commands_and_legacy_sql_flags_are_rejected() {
     for args in [
         vec!["server"],
         vec!["management"],
+        vec!["job", "--help"],
+        vec!["job", "list", "--help"],
         vec!["job", "usage"],
         vec!["--command", "SELECT 1"],
         vec!["--file", "queries.sql"],

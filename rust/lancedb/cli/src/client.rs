@@ -481,14 +481,14 @@ fn strip_leading_trivia(query: &str) -> &str {
 /// Rows of a `SHOW JOBS` listing the interactive shell will print. The registry
 /// can hold far more jobs than anyone reads at a terminal, and the server
 /// returns the listing in one shot with no cursor to resume from, so the table
-/// rendering cuts the display and points at the surfaces that can narrow or
-/// page.
+/// rendering cuts the display and points at ways to narrow the listing or
+/// export every row.
 const MAX_DISPLAYED_JOB_ROWS: usize = 1000;
 
 /// Ready a `SHOW JOBS` listing for display, returning it with any notice to
 /// print after the formatted output.
 ///
-/// The `job_id` marking applies everywhere: it is the input to `job describe`,
+/// The `job_id` marking applies everywhere: it is the input to `CANCEL JOB`,
 /// so it has to be copyable rather than readable. The row cut applies only to
 /// the interactive table rendering -- CSV/JSON/NDJSON and one-shot invocations
 /// are read by programs, which need every row and nothing but the payload.
@@ -502,8 +502,8 @@ fn prepare_show_jobs_result(
     let notice = cut.then(|| {
         format!(
             "\nShowing the first {MAX_DISPLAYED_JOB_ROWS} of {total} jobs. Narrow the \
-             listing with SHOW JOBS FOR <table>, or page through all of them with \
-             `lancedb job list`.\n"
+             listing with SHOW JOBS FOR <table>, or use lancedb sql --command 'SHOW JOBS' \
+             --format json to retrieve all rows.\n"
         )
     });
     let result = if cut {
@@ -1918,9 +1918,10 @@ mod tests {
         let over = MAX_DISPLAYED_JOB_ROWS + 1;
         let (result, notice) = prepare_show_jobs_result(jobs(over), true);
         assert_eq!(row_count(&result), MAX_DISPLAYED_JOB_ROWS);
-        assert!(notice
-            .unwrap()
-            .contains(&format!("first {MAX_DISPLAYED_JOB_ROWS} of {over} jobs")));
+        let notice = notice.unwrap();
+        assert!(notice.contains(&format!("first {MAX_DISPLAYED_JOB_ROWS} of {over} jobs")));
+        assert!(notice.contains("SHOW JOBS FOR <table>"));
+        assert!(notice.contains("lancedb sql --command 'SHOW JOBS' --format json"));
 
         // At or under the cap the listing is whole and says nothing.
         let (result, notice) = prepare_show_jobs_result(jobs(MAX_DISPLAYED_JOB_ROWS), true);

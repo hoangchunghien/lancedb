@@ -1,6 +1,6 @@
 # LanceDB CLI
 
-A command-line client for LanceDB. SQL and job commands connect to an existing
+A command-line client for LanceDB. SQL commands connect to an existing
 LanceDB Cloud or Enterprise deployment; this package does not include a server.
 
 Build and install from the LanceDB repository root:
@@ -20,9 +20,9 @@ lancedb auth login --profile production
 lancedb sql --profile production
 lancedb sql --profile production --command 'SELECT 1' --format json
 lancedb sql --profile production --file queries.sql
-lancedb job list --profile production
-lancedb job events --profile production --job-id JOB_ID
-lancedb job children --profile production --job-id JOB_ID
+lancedb sql --profile production --command 'SHOW JOBS'
+lancedb sql --profile production --command "SHOW ERRORS ON documents FOR JOB 'JOB_ID'"
+lancedb sql --profile production --command "CANCEL JOB 'JOB_ID'"
 lancedb acl list --profile production --object 'table:analytics:public$events' --format json
 lancedb acl add --profile production --principal-name Alice --object 'table:analytics:public$events' --privilege SELECT
 lancedb acl delete --profile production --principal-name Alice --object 'table:analytics:public$events' --privilege SELECT
@@ -41,19 +41,17 @@ configuration in the selected profile. Existing Enterprise profiles in
 Profile updates preserve the Enterprise `data_dir` setting. TLS and mutual TLS use
 `--ca-cert`, `--client-cert`, and `--client-key`.
 
-Commands are `auth`, `acl`, `profile`, `sql`, `job`, and `load`. ACLs support
+Commands are `auth`, `acl`, `profile`, `sql`, and `load`. ACLs support
 `list`, `add`, and `delete` through the remote catalog API. `acl list` accepts
 `--object`, one subject selector, `--limit`, and `--page-token`; it prints TSV by
 default or JSON with `--format json`. The server determines which grants the
-selected credentials may inspect or modify. Jobs support `describe`,
-`cancel`, `list`, `events`, and `children`. Use each command's `--help` for filters,
-continuation tokens, and supported output formats. Job access remains subject to
-the deployment's authorization rules. Child diagnostics are not independent jobs;
-fragment completion does not establish parent-job success.
+selected credentials may inspect or modify. Inspect and manage jobs through SQL
+with `SHOW JOBS`, `SHOW ERRORS ON <table>`, and `CANCEL JOB '<job-id>'`.
+Job access remains subject to the deployment's authorization rules.
 
-The SQL command requires the server's asynchronous Flight SQL polling protocol.
-The CLI uses the Rust SDK for SQL, jobs, and ACLs. The Enterprise executable shares the client
-library while retaining its runtime/admin commands, `job usage`, and legacy SQL
+The SQL command connects to the server's Flight SQL API.
+The CLI uses the Rust SDK for SQL and ACLs. The Enterprise executable shares the client
+library while retaining its runtime/admin commands and legacy SQL
 entry points (`lancedb`, `lancedb --command`, and `lancedb --file`). Both executables
 have the same name: installing one replaces the other in that installation path.
 

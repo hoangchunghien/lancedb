@@ -16,7 +16,7 @@ which = "6"
 anyhow = "1"
 arrow-array.workspace = true
 arrow-buffer.workspace = true
-arrow-cast = { workspace = true, features = ["prettyprint"] }
+arrow-cast.workspace = true
 arrow-flight.workspace = true
 arrow-ipc.workspace = true
 arrow-json = "58.0.0"
@@ -24,7 +24,6 @@ arrow-schema.workspace = true
 arrow-select.workspace = true
 async-stream = "0.3.6"
 async-trait.workspace = true
-chrono.workspace = true
 clap = { version = "4.5.13", features = ["derive", "env"] }
 directories = "5"
 futures.workspace = true

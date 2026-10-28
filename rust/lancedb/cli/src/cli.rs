@@ -23,13 +23,6 @@ pub enum Commands {
     Profile(crate::profile::ProfileArgs),
     /// Run SQL or open an interactive shell against a remote server
     Sql(SqlArgs),
-    /// Describe, cancel, list, and inspect jobs
-    Job {
-        #[command(flatten)]
-        args: crate::job::JobArgs,
-        #[arg(long, global = true, default_value = "table")]
-        format: String,
-    },
     /// Load data from external sources
     Load(Box<crate::load::LoadArgs>),
 }
@@ -77,7 +70,6 @@ pub async fn run(args: Args) -> Result<()> {
         Some(Commands::Acl(args)) => crate::acl::run_command(args).await,
         Some(Commands::Profile(args)) => crate::profile::run_profile_command(args).await,
         Some(Commands::Sql(args)) => run_sql(args).await,
-        Some(Commands::Job { args, format }) => crate::job::run_command(args, format).await,
         Some(Commands::Load(args)) => crate::load::run_load(*args).await,
     }
 }

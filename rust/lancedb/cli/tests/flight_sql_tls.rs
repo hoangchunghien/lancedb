@@ -319,6 +319,10 @@ async fn run_sql_file(script: &str) -> (std::process::Output, Vec<String>) {
 async fn sql_files_preserve_comments_and_quoted_semicolons() {
     for (script, expected) in [
         (
+            "SHOW JOBS; CANCEL JOB 'job-123';",
+            vec!["SHOW JOBS", "CANCEL JOB 'job-123'"],
+        ),
+        (
             "SELECT 1 -- documentation; DELETE FROM customers\n;",
             vec!["SELECT 1 -- documentation; DELETE FROM customers"],
         ),

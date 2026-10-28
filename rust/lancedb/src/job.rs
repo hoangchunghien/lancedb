@@ -3,12 +3,6 @@
 
 //! Handles to operations a server may run asynchronously.
 
-pub mod details;
-pub use details::{
-    JobCancelOptions, JobChildrenPage, JobChildrenRequest, JobDetails, JobEventOptions,
-    JobListOptions, JobListPage,
-};
-
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -68,15 +62,6 @@ pub(crate) trait JobHandle: Send + Sync {
     }
     fn job_type(&self) -> Option<&str> {
         None
-    }
-    async fn details(&self) -> Result<JobDetails> {
-        job_detail_not_supported("job details")
-    }
-    async fn event_page(&self, _request: JobEventOptions) -> Result<Vec<RecordBatch>> {
-        job_detail_not_supported("paginated events")
-    }
-    async fn children(&self, _request: JobChildrenRequest) -> Result<JobChildrenPage> {
-        job_detail_not_supported("job children")
     }
     async fn status(&self) -> Result<String>;
     async fn wait(&self) -> Result<TerminalResult>;
@@ -453,70 +438,6 @@ where
                     .to_string(),
             }),
         }
-    }
-
-    /// Fetch the complete server record without normalizing its state vocabulary.
-    pub async fn details(&self) -> Result<JobDetails> {
-        match &self.inner {
-            JobInner::Handle { handle, .. } => handle.details().await,
-            _ => job_detail_not_supported("job details"),
-        }
-    }
-
-    /// Fetch one page of child diagnostics and parent progress.
-    /// The handle's ID takes precedence over the request's ID.
-    pub async fn children(&self, mut request: JobChildrenRequest) -> Result<JobChildrenPage> {
-        request.job_id = self
-            .id()
-            .ok_or_else(|| Error::NotSupported {
-                message: "job has no server ID".into(),
-            })?
-            .into();
-        match &self.inner {
-            JobInner::Handle { handle, .. } => handle.children(request).await,
-            _ => job_detail_not_supported("job children"),
-        }
-    }
-
-    /// Stream event pages, retaining continuation and availability schema metadata.
-    /// Stops on an empty page, repeated token, exhaustion, or the total row limit.
-    pub fn event_pages(
-        &self,
-        request: JobEventOptions,
-    ) -> impl futures::Stream<Item = Result<Vec<RecordBatch>>> + '_ {
-        let seen = request
-            .page_token
-            .iter()
-            .cloned()
-            .collect::<std::collections::HashSet<_>>();
-        futures::stream::try_unfold(
-            (request, false, seen),
-            move |(mut request, done, mut seen)| async move {
-                if done || request.limit == Some(0) {
-                    return Ok(None);
-                }
-                let mut page_request = request.clone();
-                page_request.limit = Some(
-                    request
-                        .limit
-                        .unwrap_or(details::MAX_JOB_EVENT_QUERY_RESULTS)
-                        .min(details::MAX_JOB_EVENT_QUERY_RESULTS),
-                );
-                let page = match &self.inner {
-                    JobInner::Handle { handle, .. } => handle.event_page(page_request).await?,
-                    _ => return job_detail_not_supported("job event history"),
-                };
-                let rows = page.iter().map(RecordBatch::num_rows).sum::<usize>();
-                let token = details::job_event_page_token(&page);
-                let done = rows == 0
-                    || token
-                        .as_ref()
-                        .is_none_or(|token| !seen.insert(token.clone()));
-                request.limit = request.limit.map(|limit| limit.saturating_sub(rows as u32));
-                request.page_token = token;
-                Ok(Some((page, (request, done, seen))))
-            },
-        )
     }
 
     /// Waits until the operation reaches a terminal state.
