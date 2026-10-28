@@ -64,6 +64,25 @@ be enabled for your Enterprise cluster.
 [Training data loaders](/training/data-loading), available in both offerings,
 read the resulting datasets for model training.
 
+## Enterprise-only features {#enterprise-features}
+
+These features are available in LanceDB Enterprise and not in LanceDB Embedded.
+Some must be enabled for your Enterprise cluster; each page lists its requirements.
+
+| Area | Feature | What it adds |
+| --- | --- | --- |
+| Search | [Distributed search](/enterprise/distributed-search) | Spreads index execution and table-data reads across the cluster. |
+| SQL | [SQL endpoint](/basics/sql) | Queries tables through Arrow Flight SQL. |
+| SQL | [Joining datasets](/curation/join) | SQL joins across tables. |
+| SQL | [Profiling a dataset](/curation/aggregate) | SQL aggregation. |
+| SQL | [Ranking and deduplication](/curation/windowing) | SQL window functions. |
+| SQL | [SQL sampling](/curation/sampling) | SQL `TABLESAMPLE`. |
+| Catalog | [Functions](/management/function) | Registers and runs Functions on the cluster. |
+| Catalog | [Views](/management/view) | Named saved queries that run against their source tables. |
+| Security | [Authentication](/enterprise/authentication) | API key and OAuth token authentication. |
+| Security | [Authorization](/governance/authorization) | Catalog privileges, when the administrator configures enforcement. |
+| Operations | [Background jobs](/maintenance/background-jobs) | Scheduled maintenance, such as compaction, cleanup, and reindexing. |
+
 ## Plan your Enterprise deployment {#get-started}
 
 [Talk to us about your workload](https://www.lancedb.com/contact) to discuss your
