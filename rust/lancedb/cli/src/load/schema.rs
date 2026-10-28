@@ -4,8 +4,9 @@
 //! Schema inference and transformation utilities.
 
 use anyhow::{Context, Result};
-use arrow_array::{Array, ArrayRef, FixedSizeListArray, ListArray, RecordBatch};
+use arrow_array::{new_null_array, Array, ArrayRef, FixedSizeListArray, ListArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_select::concat::concat;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::info;
@@ -136,6 +137,8 @@ pub fn transform_schema(
 }
 
 /// Transform a record batch to convert List columns to FixedSizeList for all vector columns.
+/// Preserves row boundaries and nulls, and rejects non-null lists whose lengths
+/// differ from the target dimension. Row numbers in errors are relative to this batch.
 pub fn transform_batch(
     batch: &RecordBatch,
     target_schema: &SchemaRef,
@@ -149,12 +152,11 @@ pub fn transform_batch(
         .map(|(field, col)| {
             if vector_columns.contains_key(field.name()) {
                 convert_to_fixed_size_list(col, target_schema, field.name())
-                    .unwrap_or_else(|_| col.clone())
             } else {
-                col.clone()
+                Ok(col.clone())
             }
         })
-        .collect();
+        .collect::<Result<_>>()?;
 
     RecordBatch::try_new(target_schema.clone(), columns)
         .context("Failed to create transformed batch")
@@ -170,8 +172,8 @@ fn convert_to_fixed_size_list(
         .field_with_name(column_name)
         .context("Column not found in target schema")?;
 
-    let dims = match target_field.data_type() {
-        DataType::FixedSizeList(_, d) => *d,
+    let (inner_field, dims) = match target_field.data_type() {
+        DataType::FixedSizeList(inner, d) => (inner, *d),
         _ => return Ok(array.clone()), // Not a FixedSizeList target, return as-is
     };
 
@@ -182,29 +184,57 @@ fn convert_to_fixed_size_list(
                 .downcast_ref::<ListArray>()
                 .ok_or_else(|| anyhow::anyhow!("Failed to downcast to ListArray"))?;
 
-            // Flatten all values and create FixedSizeList
-            let values = list_array.values();
-
-            // Create inner field matching the actual data type
-            let (inner_field, float_values): (Arc<Field>, ArrayRef) = match values.data_type() {
-                DataType::Float16 => (
-                    Arc::new(Field::new("item", DataType::Float16, true)),
-                    values.clone(),
-                ),
-                DataType::Float32 => (
-                    Arc::new(Field::new("item", DataType::Float32, true)),
-                    values.clone(),
-                ),
-                DataType::Float64 => (
-                    Arc::new(Field::new("item", DataType::Float64, true)),
-                    values.clone(),
-                ),
+            match list_array.values().data_type() {
+                DataType::Float16 | DataType::Float32 | DataType::Float64 => {}
                 other => {
                     anyhow::bail!("Unsupported vector element type: {:?}", other);
                 }
+            }
+
+            let size = usize::try_from(dims).context("Vector dimension must be non-negative")?;
+            for row in 0..list_array.len() {
+                if list_array.is_valid(row) {
+                    let actual = list_array.value_length(row) as usize;
+                    if actual != size {
+                        anyhow::bail!(
+                            "Column '{column_name}', row {row}: expected vector dimension \
+                             {dims}, got {actual}"
+                        );
+                    }
+                }
+            }
+
+            let values = if list_array.null_count() == 0 {
+                // A sliced list retains its original child buffer. Restrict the
+                // values to the logical rows after validating their boundaries.
+                let start = list_array.value_offsets()[0] as usize;
+                list_array.values().slice(start, list_array.len() * size)
+            } else {
+                // Null lists can cover any number of child values. Give them
+                // fixed-width null slots instead of using their hidden values.
+                let rows: Vec<ArrayRef> = (0..list_array.len())
+                    .map(|row| {
+                        if list_array.is_null(row) {
+                            new_null_array(list_array.values().data_type(), size)
+                        } else {
+                            list_array.value(row)
+                        }
+                    })
+                    .collect();
+                let rows: Vec<&dyn Array> = rows.iter().map(|row| row.as_ref()).collect();
+                concat(&rows)?
             };
 
-            let fsl = FixedSizeListArray::new(inner_field, dims, float_values, None);
+            let fsl = FixedSizeListArray::try_new_with_length(
+                inner_field.clone(),
+                dims,
+                values,
+                list_array.nulls().cloned(),
+                list_array.len(),
+            )
+            .with_context(|| {
+                format!("Failed to convert column '{column_name}' to FixedSizeList")
+            })?;
             Ok(Arc::new(fsl))
         }
         DataType::FixedSizeList(_, _) => {
@@ -238,6 +268,143 @@ mod tests {
         let offsets = arrow_buffer::OffsetBuffer::from_lengths([3, 3]);
         let field = Arc::new(Field::new("item", inner_type, true));
         ListArray::new(field, offsets, values, None)
+    }
+
+    fn vector_batch(lists: ListArray) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("vector", lists.data_type().clone(), true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..lists.len() as i64)),
+                Arc::new(lists),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn float_lists(lengths: &[usize], values: Vec<Option<f32>>) -> ListArray {
+        ListArray::new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            arrow_buffer::OffsetBuffer::from_lengths(lengths.iter().copied()),
+            Arc::new(Float32Array::from(values)),
+            None,
+        )
+    }
+
+    fn transform_vectors(batch: &RecordBatch) -> Result<RecordBatch> {
+        let vectors = detect_vector_columns(batch);
+        let schema = transform_schema(&batch.schema(), &vectors)?;
+        transform_batch(batch, &schema, &vectors)
+    }
+
+    #[test]
+    fn rejects_ragged_and_empty_non_null_vectors() {
+        for (lengths, values, expected) in [
+            (vec![2, 1, 3], vec![1., 2., 3., 4., 5., 6.], 1),
+            (vec![2, 0], vec![1., 2.], 0),
+        ] {
+            let batch = vector_batch(float_lists(
+                &lengths,
+                values.into_iter().map(Some).collect(),
+            ));
+            let error = transform_vectors(&batch).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("Column 'vector', row 1: expected vector dimension 2, got {expected}")
+            );
+        }
+    }
+
+    #[test]
+    fn sliced_vectors_preserve_offsets_and_row_ids() {
+        let batch = vector_batch(float_lists(
+            &[1, 2, 2, 1],
+            vec![Some(99.), Some(1.), None, Some(3.), Some(4.), Some(88.)],
+        ))
+        .slice(1, 2);
+        let transformed = transform_vectors(&batch).unwrap();
+        assert_eq!(transformed.column(0), batch.column(0));
+        let vectors = transformed
+            .column(1)
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        assert_eq!(vectors.len(), 2);
+        assert_eq!(
+            vectors.values().as_ref(),
+            &Float32Array::from(vec![Some(1.), None, Some(3.), Some(4.)])
+        );
+    }
+
+    #[test]
+    fn sliced_nullable_vectors_preserve_parent_and_child_nulls() {
+        for hidden_len in [0, 2, 3] {
+            let mut values = vec![Some(99.), Some(1.), None];
+            values.extend(vec![Some(123.); hidden_len]);
+            values.extend([Some(3.), Some(4.), Some(88.)]);
+            let lists = float_lists(&[1, 2, hidden_len, 2, 1], values);
+            let lists = ListArray::new(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                lists.offsets().clone(),
+                lists.values().clone(),
+                Some(arrow_buffer::NullBuffer::from(vec![
+                    false, true, false, true, false,
+                ])),
+            );
+            let batch = vector_batch(lists).slice(1, 3);
+            let transformed = transform_vectors(&batch).unwrap();
+            assert_eq!(transformed.column(0), batch.column(0));
+            let vectors = transformed
+                .column(1)
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .unwrap();
+            assert_eq!(vectors.len(), 3);
+            assert!(vectors.is_valid(0));
+            assert!(vectors.is_null(1));
+            assert!(vectors.is_valid(2));
+            assert_eq!(
+                vectors.values().as_ref(),
+                &Float32Array::from(vec![Some(1.), None, None, None, Some(3.), Some(4.)])
+            );
+        }
+    }
+
+    #[test]
+    fn validates_dimensions_in_later_batches() {
+        let first = vector_batch(float_lists(&[2], vec![Some(1.), Some(2.)]));
+        let vectors = detect_vector_columns(&first);
+        let schema = transform_schema(&first.schema(), &vectors).unwrap();
+        transform_batch(&first, &schema, &vectors).unwrap();
+
+        let next = vector_batch(float_lists(&[3], vec![Some(3.), Some(4.), Some(5.)]));
+        let error = transform_batch(&next, &schema, &vectors).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Column 'vector', row 0: expected vector dimension 2, got 3"
+        );
+    }
+
+    #[test]
+    fn handles_all_null_and_empty_later_batches() {
+        let first = vector_batch(float_lists(&[2], vec![Some(1.), Some(2.)]));
+        let vectors = detect_vector_columns(&first);
+        let schema = transform_schema(&first.schema(), &vectors).unwrap();
+        let lists = float_lists(&[0, 3, 1], vec![Some(123.); 4]);
+        let nulls = ListArray::new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            lists.offsets().clone(),
+            lists.values().clone(),
+            Some(arrow_buffer::NullBuffer::new_null(3)),
+        );
+        for lists in [nulls, float_lists(&[], vec![])] {
+            let batch = vector_batch(lists);
+            let transformed = transform_batch(&batch, &schema, &vectors).unwrap();
+            assert_eq!(transformed.num_rows(), batch.num_rows());
+            assert_eq!(transformed.column(1).null_count(), batch.num_rows());
+        }
     }
 
     #[test]
@@ -324,6 +491,21 @@ mod tests {
                     "{}: inner type mismatch",
                     case.name
                 );
+                let transformed = transform_vectors(&batch).unwrap();
+                let vectors = transformed
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<FixedSizeListArray>()
+                    .unwrap();
+                let original = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<ListArray>()
+                    .unwrap();
+                assert_eq!(vectors.len(), original.len());
+                for row in 0..original.len() {
+                    assert_eq!(vectors.value(row).as_ref(), original.value(row).as_ref());
+                }
             } else {
                 assert!(
                     vector_columns.is_empty(),
