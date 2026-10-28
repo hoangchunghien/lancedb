@@ -7,6 +7,9 @@ use directories::UserDirs;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// The default profile name used when no profile is specified
@@ -543,6 +546,16 @@ impl Default for Config {
     }
 }
 
+fn create_config_directory(path: &Path) -> Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder
+        .create(path)
+        .with_context(|| format!("Failed to create config directory: {:?}", path))
+}
+
 impl Config {
     /// The database a client uses without `--database`: the default profile's, else the username.
     pub fn default_database(&self) -> String {
@@ -617,24 +630,44 @@ impl Config {
         }
     }
 
-    /// Save config to the default location
+    /// Save config to the default location. On Unix, restrict the app-owned
+    /// directory to mode 0700, including when it already exists.
     pub fn save_default(&self) -> Result<()> {
         let config_path = Self::default_config_path()?;
+        #[cfg(unix)]
+        {
+            let parent = config_path.parent().context("Config path has no parent")?;
+            create_config_directory(parent)?;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("Failed to restrict config directory: {:?}", parent))?;
+        }
         self.save_to_path(&config_path)
     }
 
-    /// Save config to a specific path
+    /// Atomically replace config at a specific path. On Unix, the new file is
+    /// mode 0600, even when replacing a permissive file. Newly created parent
+    /// directories are private; existing custom parent directories are unchanged.
     pub fn save_to_path(&self, path: &Path) -> Result<()> {
-        // Create parent directory if it doesn't exist
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create config directory: {:?}", parent))?;
-        }
-
         let contents = toml::to_string_pretty(self).context("Failed to serialize config")?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        create_config_directory(parent)?;
 
-        fs::write(path, contents)
+        // tempfile creates Unix files with mode 0600 from the outset. Set it
+        // explicitly before writing secrets so an owner-masking umask also works.
+        let mut file = tempfile::NamedTempFile::new_in(parent)
+            .with_context(|| format!("Failed to create private config file in {:?}", parent))?;
+        #[cfg(unix)]
+        file.as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("Failed to restrict config file: {:?}", path))?;
+        file.write_all(contents.as_bytes())
             .with_context(|| format!("Failed to write config file: {:?}", path))?;
+        file.persist(path)
+            .map_err(|error| error.error)
+            .with_context(|| format!("Failed to replace config file: {:?}", path))?;
 
         Ok(())
     }
@@ -804,6 +837,53 @@ mod tests {
                 .unwrap()
                 .azure_storage_account_name,
             Some("teststorageacct".to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_saves_are_private_without_changing_custom_parent_modes() {
+        let dir = tempdir().unwrap();
+        let parent = dir.path().join("custom");
+        let path = parent.join("config.toml");
+        let mut config = Config::default();
+        config.set_profile(
+            "cloud",
+            Profile {
+                api_key: Some("initial-key".into()),
+                ..Profile::default()
+            },
+        );
+        config.save_to_path(&path).unwrap();
+        assert_eq!(
+            fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        config.profiles.get_mut("cloud").unwrap().api_key = Some("updated-key".into());
+        config.save_to_path(&path).unwrap();
+
+        assert_eq!(
+            fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            Config::load_from_path(&path)
+                .unwrap()
+                .get_profile(Some("cloud"))
+                .api_key
+                .as_deref(),
+            Some("updated-key")
         );
     }
 

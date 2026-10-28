@@ -64,3 +64,72 @@ fn profile_updates_preserve_enterprise_data_directory() {
         Some("analytics")
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn api_key_profiles_are_private_under_permissive_umasks_and_after_edits() {
+    use lancedb_cli::server_config::Config;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    for mask in ["022", "000"] {
+        let home = tempfile::tempdir().unwrap();
+        let config_dir = home.path().join(".lancedb");
+        let path = config_dir.join("config.toml");
+        let run = |command: &str, key: &str| {
+            // Set umask only in the child, leaving other test threads unaffected.
+            let output = Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    r#"umask "$1"; shift; exec "$@""#,
+                    "profile-permissions",
+                    mask,
+                    env!("CARGO_BIN_EXE_lancedb"),
+                    "profile",
+                    command,
+                    "cloud",
+                    "--api-key",
+                    key,
+                    "--database",
+                    "analytics",
+                ])
+                .env("HOME", home.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{command} under umask {mask}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        let assert_private = || {
+            assert_eq!(
+                fs::metadata(&config_dir).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "config directory under umask {mask}"
+            );
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "config file under umask {mask}"
+            );
+        };
+
+        run("create", "initial-key");
+        assert_private();
+
+        fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        run("edit", "replacement-key");
+        assert_private();
+        let saved = Config::load_from_path(&path).unwrap();
+        assert_eq!(
+            saved.get_profile(Some("cloud")).api_key.as_deref(),
+            Some("replacement-key")
+        );
+        assert_eq!(
+            saved.get_profile(Some("cloud")).database.as_deref(),
+            Some("analytics")
+        );
+    }
+}
