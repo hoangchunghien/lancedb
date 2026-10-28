@@ -2,9 +2,45 @@
 // SPDX-FileCopyrightText: Copyright The LanceDB Authors
 
 use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use async_trait::async_trait;
 use clap::Parser;
+use futures::stream::BoxStream;
+use lancedb_cli::load::sources::DataSource;
+use lancedb_cli::load::writer::load_to_lancedb;
 use lancedb_cli::load::{run_load, LoadArgs};
+use std::collections::HashMap;
 use std::sync::Arc;
+
+struct UnreadableSource;
+
+#[async_trait]
+impl DataSource for UnreadableSource {
+    async fn schema(&self) -> anyhow::Result<SchemaRef> {
+        Ok(Arc::new(Schema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            true,
+        )])))
+    }
+
+    async fn total_rows(&self) -> anyhow::Result<Option<u64>> {
+        Ok(None)
+    }
+
+    async fn detect_vector_columns(
+        &self,
+    ) -> anyhow::Result<HashMap<String, lancedb_cli::load::schema::VectorColumnInfo>> {
+        // Let preflight succeed so the failure comes from the import stream.
+        Ok(HashMap::new())
+    }
+
+    fn stream_batches(&self, _batch_size: usize) -> BoxStream<'_, anyhow::Result<RecordBatch>> {
+        Box::pin(futures::stream::once(async {
+            anyhow::bail!("source read failed")
+        }))
+    }
+}
 
 #[tokio::test]
 async fn load_lance_into_local_database_and_overwrite() {
@@ -38,29 +74,105 @@ async fn load_lance_into_local_database_and_overwrite() {
         .unwrap()
     };
     run_load(args()).await.unwrap();
-    assert!(run_load(args())
-        .await
-        .unwrap_err()
-        .to_string()
-        .contains("Failed to load data"));
-    let mut overwrite = args();
-    overwrite.overwrite = true;
-    run_load(overwrite).await.unwrap();
+    let error = run_load(args()).await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("already exists. Use --overwrite"),
+        "{error:#}"
+    );
     let connection = lancedb::connect(destination.to_str().unwrap())
         .execute()
         .await
         .unwrap();
-    assert_eq!(
-        connection
-            .open_table("events")
+    let original = connection.open_table("events").execute().await.unwrap();
+    let original_version = original.version().await.unwrap();
+
+    let replacement = dir.path().join("replacement.lance");
+    let batch = RecordBatch::try_from_iter([(
+        "id",
+        Arc::new(Int32Array::from(vec![4, 5, 6, 7, 8])) as arrow_array::ArrayRef,
+    )])
+    .unwrap();
+    lance::Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+        replacement.to_str().unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+    let mut overwrite = args();
+    overwrite.dataset = Some(replacement.to_string_lossy().into_owned());
+    overwrite.overwrite = true;
+    overwrite.batch_size = 2;
+    run_load(overwrite).await.unwrap();
+
+    let table = connection.open_table("events").execute().await.unwrap();
+    assert_eq!(table.count_rows(None).await.unwrap(), 5);
+    assert!(table.version().await.unwrap() > original_version);
+    table.checkout(original_version).await.unwrap();
+    assert_eq!(table.count_rows(None).await.unwrap(), 3);
+}
+
+#[tokio::test]
+async fn overwrite_source_failures_preserve_data_and_history() {
+    for failure in ["open", "read"] {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("db");
+        let connection = lancedb::connect(destination.to_str().unwrap())
             .execute()
             .await
-            .unwrap()
-            .count_rows(None)
+            .unwrap();
+        let batch = RecordBatch::try_from_iter([(
+            "id",
+            Arc::new(Int32Array::from(vec![1, 2, 3])) as arrow_array::ArrayRef,
+        )])
+        .unwrap();
+        let table = connection
+            .create_table("events", batch.clone())
+            .execute()
             .await
-            .unwrap(),
-        3
-    );
+            .unwrap();
+        let first_version = table.version().await.unwrap();
+        table.add(batch).execute().await.unwrap();
+        let original_version = table.version().await.unwrap();
+
+        let missing_source = dir.path().join("missing.lance");
+        let args = LoadArgs::try_parse_from([
+            "load",
+            "--source",
+            "lance",
+            "--dataset",
+            missing_source.to_str().unwrap(),
+            "--table",
+            "events",
+            "--destination",
+            destination.to_str().unwrap(),
+            "--overwrite",
+        ])
+        .unwrap();
+        let error = if failure == "open" {
+            run_load(args).await.unwrap_err()
+        } else {
+            let mut connection_args = args.connection.clone();
+            connection_args.http_server_url = args.destination.clone();
+            let conn = connection_args.resolve(None).unwrap();
+            load_to_lancedb(&args, &conn, &UnreadableSource)
+                .await
+                .unwrap_err()
+        };
+        let expected_error = if failure == "open" {
+            "failed to open Lance dataset"
+        } else {
+            "source read failed"
+        };
+        assert!(format!("{error:#}").contains(expected_error), "{error:#}");
+
+        let table = connection.open_table("events").execute().await.unwrap();
+        assert_eq!(table.version().await.unwrap(), original_version);
+        assert_eq!(table.count_rows(None).await.unwrap(), 6);
+        assert_eq!(table.list_versions().await.unwrap().len(), 2);
+        table.checkout(first_version).await.unwrap();
+        assert_eq!(table.count_rows(None).await.unwrap(), 3);
+    }
 }
 
 #[test]

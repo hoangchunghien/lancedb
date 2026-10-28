@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use arrow_array::RecordBatchIterator;
 use futures::{StreamExt, TryStreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
+use lancedb::database::CreateTableMode;
 use lancedb::index::scalar::FtsIndexBuilder;
 use lancedb::index::vector::IvfPqIndexBuilder;
 use lancedb::index::Index;
@@ -298,6 +299,8 @@ async fn wait_for_indexes(
 }
 
 /// Load data from a source into a LanceDB table.
+/// Overwrites replace the table with the first successfully read and transformed
+/// batch. Subsequent batches are appended in separate commits.
 pub async fn load_to_lancedb(
     args: &LoadArgs,
     conn: &ResolvedConnection,
@@ -313,16 +316,12 @@ pub async fn load_to_lancedb(
         .await
         .context("Failed to connect to LanceDB")?;
 
-    // Check if table exists
-    let table_names: Vec<String> = db
-        .list_tables(&[], Default::default())
-        .try_collect()
-        .await?;
-    if table_names.contains(&args.table) {
-        if args.overwrite {
-            info!("Dropping existing table '{}'", args.table);
-            db.drop_table(&args.table, &[]).await?;
-        } else {
+    if !args.overwrite {
+        let table_names: Vec<String> = db
+            .list_tables(&[], Default::default())
+            .try_collect()
+            .await?;
+        if table_names.contains(&args.table) {
             anyhow::bail!(
                 "Table '{}' already exists. Use --overwrite to replace it.",
                 args.table
@@ -377,6 +376,11 @@ pub async fn load_to_lancedb(
             info!("Creating table '{}'...", args.table);
             let created = db
                 .create_table(&args.table, batches)
+                .mode(if args.overwrite {
+                    CreateTableMode::Overwrite
+                } else {
+                    CreateTableMode::Create
+                })
                 .execute()
                 .await
                 .context("Failed to create table")?;
