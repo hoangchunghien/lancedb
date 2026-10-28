@@ -4,6 +4,122 @@
 use std::process::Command;
 
 #[test]
+fn an_unconfigured_default_sql_invocation_prints_usage() {
+    use lancedb_cli::server_config::{Config, Profile};
+
+    for has_http_profile in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        if has_http_profile {
+            let mut config = Config::default();
+            config.set_profile(
+                "cloud",
+                Profile {
+                    http_server_url: Some("http://api.example.com".into()),
+                    ..Default::default()
+                },
+            );
+            config.set_default_profile("cloud");
+            config
+                .save_to_path(&home.path().join(".lancedb/config.toml"))
+                .unwrap();
+        }
+        let output = Command::new(env!("CARGO_BIN_EXE_lancedb"))
+            .env("HOME", home.path())
+            .env("LANCEDB_API_KEY", "secret-that-must-not-appear")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("Usage:"), "{stdout}");
+        assert!(
+            stdout.contains("No Flight SQL endpoint is configured"),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("secret-that-must-not-appear"));
+        assert!(
+            output.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if !has_http_profile {
+            assert!(!home.path().join(".lancedb").exists());
+        }
+    }
+}
+
+#[test]
+fn explicit_sql_requests_require_a_configured_endpoint() {
+    for args in [
+        vec!["sql"],
+        vec!["--command", "SELECT 1"],
+        vec!["--file", "queries.sql"],
+        vec!["--profile", "missing"],
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_lancedb"))
+            .args(&args)
+            .env("HOME", home.path())
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("No Flight SQL endpoint is configured"),
+            "{args:?}: {stderr}"
+        );
+        assert!(stderr.contains("--sql-server-url"), "{stderr}");
+        assert!(stderr.contains("--profile local"), "{stderr}");
+        assert!(!home.path().join(".lancedb").exists());
+    }
+}
+
+#[test]
+fn selecting_local_as_default_persists_its_endpoint() {
+    use lancedb_cli::server_config::{Config, Profile};
+
+    for existing_endpoint in [None, Some("localhost:12345")] {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(".lancedb/config.toml");
+        if let Some(endpoint) = existing_endpoint {
+            let mut config = Config::default();
+            config.set_profile(
+                "local",
+                Profile {
+                    sql_server_url: Some(endpoint.into()),
+                    ..Default::default()
+                },
+            );
+            config.save_to_path(&path).unwrap();
+        }
+        let output = Command::new(env!("CARGO_BIN_EXE_lancedb"))
+            .args(["profile", "set", "local"])
+            .env("HOME", home.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let config = Config::load_from_path(&path).unwrap();
+        assert_eq!(config.default_profile.as_deref(), Some("local"));
+        assert_eq!(
+            config
+                .profiles
+                .get("local")
+                .unwrap()
+                .sql_server_url
+                .as_deref(),
+            Some(existing_endpoint.unwrap_or("localhost:10025"))
+        );
+    }
+}
+
+#[test]
 fn help_lists_commands_without_creating_configuration() {
     let home = tempfile::tempdir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_lancedb"))

@@ -352,6 +352,11 @@ fn set_default_profile(name: &str) -> Result<()> {
         ));
     }
 
+    // Persist the addresses when localhost is explicitly selected, so a later
+    // default SQL invocation can distinguish this choice from an unset endpoint.
+    if name == "local" && !config.profiles.contains_key(name) {
+        config.set_profile(name, Profile::local_default());
+    }
     config.set_default_profile(name);
     config.save_default()?;
 

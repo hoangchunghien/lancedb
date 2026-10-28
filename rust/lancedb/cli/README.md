@@ -9,10 +9,15 @@ Build and install from the LanceDB repository root:
 cargo install --locked --path rust/lancedb/cli
 ```
 
-The executable is `lancedb`. Running it without a subcommand opens the SQL shell.
-Use `lancedb --help` to list commands. SQL options work with or without the `sql`
+The executable is `lancedb`. Running it without a subcommand opens the SQL shell
+when the default profile has a Flight SQL endpoint. Without one, it prints usage
+and connection setup guidance. Use `lancedb --help` to list commands.
+SQL options work with or without the `sql`
 subcommand and stay scoped to SQL. Other commands accept their own options after
 the subcommand; root SQL options cannot be combined with another subcommand.
+SQL commands and files require an endpoint from `--sql-server-url` or the selected
+profile. Use `lancedb --profile local` to explicitly connect to localhost, or
+`lancedb profile set local` to save that choice as the default.
 
 ```sh
 lancedb profile create production \

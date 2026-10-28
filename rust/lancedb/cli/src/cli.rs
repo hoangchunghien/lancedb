@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The LanceDB Authors
 
-use crate::server_config::ConnectionArgs;
-use anyhow::Result;
-use clap::{Parser, Subcommand};
+use crate::server_config::{ConnectionArgs, ResolvedConnection};
+use anyhow::{bail, Context, Result};
+use clap::{CommandFactory, Parser, Subcommand};
 
 /// Public client commands. Runtime and administrative commands live in Enterprise.
 #[derive(Parser, Debug)]
@@ -51,8 +51,15 @@ pub struct SqlArgs {
     pub format: String,
 }
 
+const SQL_ENDPOINT_HELP: &str = "No Flight SQL endpoint is configured. Use --sql-server-url, \
+    select a profile with sql_server_url, or use --profile local for localhost.";
+
 pub async fn run_sql(args: SqlArgs) -> Result<()> {
-    let connection = args.connection.resolve(None)?;
+    let connection = args.connection.resolve_sql()?.context(SQL_ENDPOINT_HELP)?;
+    run_sql_with_connection(args, connection).await
+}
+
+async fn run_sql_with_connection(args: SqlArgs, connection: ResolvedConnection) -> Result<()> {
     if let Some(file) = args.file {
         crate::client::run_client_script_with_writer(
             &connection,
@@ -70,7 +77,19 @@ pub async fn run_sql(args: SqlArgs) -> Result<()> {
 
 pub async fn run(args: Args) -> Result<()> {
     match args.command {
-        None => run_sql(args.sql).await,
+        None => match args.sql.connection.resolve_sql()? {
+            Some(connection) => run_sql_with_connection(args.sql, connection).await,
+            None if args.sql.command_string.is_none()
+                && args.sql.file.is_none()
+                && args.sql.connection.profile.is_none() =>
+            {
+                println!("{SQL_ENDPOINT_HELP}\n");
+                Args::command().print_help()?;
+                println!();
+                Ok(())
+            }
+            None => bail!(SQL_ENDPOINT_HELP),
+        },
         Some(Commands::Auth(args)) => crate::auth::run(args, None).await,
         Some(Commands::Acl(args)) => crate::acl::run_command(args).await,
         Some(Commands::Profile(args)) => crate::profile::run_profile_command(args).await,

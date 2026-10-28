@@ -318,7 +318,42 @@ impl ConnectionArgs {
     /// Precedence: CLI/env args > profile > defaults
     pub fn resolve(&self, default_database: Option<&str>) -> Result<ResolvedConnection> {
         let config = Config::load_default()?;
+        self.resolve_with_config(&config, default_database)
+    }
 
+    /// Resolve SQL only when an endpoint was supplied by a flag or saved
+    /// profile. The built-in localhost endpoint requires `--profile local`.
+    pub(crate) fn resolve_sql(&self) -> Result<Option<ResolvedConnection>> {
+        self.resolve_sql_with_config(&Config::load_default()?)
+    }
+
+    fn resolve_sql_with_config(&self, config: &Config) -> Result<Option<ResolvedConnection>> {
+        let profile_name = self
+            .profile
+            .as_deref()
+            .or(config.default_profile.as_deref())
+            .unwrap_or(DEFAULT_PROFILE);
+        let endpoint = self.sql_server_url.as_deref().or_else(|| {
+            config
+                .profiles
+                .get(profile_name)
+                .and_then(|profile| profile.sql_server_url.as_deref())
+        });
+        if let Some(endpoint) = endpoint {
+            if endpoint.trim().is_empty() {
+                bail!("Flight SQL endpoint cannot be empty");
+            }
+        } else if self.profile.as_deref() != Some(DEFAULT_PROFILE) {
+            return Ok(None);
+        }
+        self.resolve_with_config(config, None).map(Some)
+    }
+
+    fn resolve_with_config(
+        &self,
+        config: &Config,
+        default_database: Option<&str>,
+    ) -> Result<ResolvedConnection> {
         // Determine the effective profile name
         let profile_name = self
             .profile
@@ -503,7 +538,7 @@ impl Profile {
         Ok(())
     }
 
-    /// Create the default "local" profile for use with `lancedb server`
+    /// Create the built-in profile for a local SQL/HTTP deployment.
     pub fn local_default() -> Self {
         Self {
             sql_server_url: Some("localhost:10025".to_string()),
@@ -716,6 +751,83 @@ impl Config {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn sql_resolution_does_not_invent_an_endpoint() {
+        let args = ConnectionArgs {
+            api_key: Some("test-key".into()),
+            http_server_url: Some("http://api.example.com".into()),
+            ..Default::default()
+        };
+        let mut config = Config::default();
+        assert!(args.resolve_sql_with_config(&config).unwrap().is_none());
+        config.set_profile("cloud", Profile::default());
+        config.set_default_profile("cloud");
+        assert!(args.resolve_sql_with_config(&config).unwrap().is_none());
+
+        let local = ConnectionArgs {
+            profile: Some("local".into()),
+            ..args
+        };
+        assert_eq!(
+            local
+                .resolve_sql_with_config(&config)
+                .unwrap()
+                .unwrap()
+                .sql_server_url,
+            "localhost:10025"
+        );
+    }
+
+    #[test]
+    fn sql_resolution_uses_a_saved_endpoint_or_an_explicit_override() {
+        let args = ConnectionArgs {
+            api_key: Some("test-key".into()),
+            ..Default::default()
+        };
+        let mut config = Config::default();
+        config.set_profile(
+            "cloud",
+            Profile {
+                sql_server_url: Some("grpcs://sql.example.com:10025".into()),
+                ..Default::default()
+            },
+        );
+        config.set_default_profile("cloud");
+        assert_eq!(
+            args.resolve_sql_with_config(&config)
+                .unwrap()
+                .unwrap()
+                .sql_server_url,
+            "grpcs://sql.example.com:10025"
+        );
+        let override_args = ConnectionArgs {
+            sql_server_url: Some("localhost:12345".into()),
+            ..args
+        };
+        assert_eq!(
+            override_args
+                .resolve_sql_with_config(&config)
+                .unwrap()
+                .unwrap()
+                .sql_server_url,
+            "localhost:12345"
+        );
+    }
+
+    #[test]
+    fn sql_resolution_rejects_an_empty_configured_endpoint() {
+        let args = ConnectionArgs {
+            sql_server_url: Some(" ".into()),
+            ..Default::default()
+        };
+        let error = args
+            .resolve_sql_with_config(&Config::default())
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Flight SQL endpoint cannot be empty"));
+    }
 
     #[test]
     fn test_parse_endpoint_defaults_to_plaintext() {
