@@ -56,9 +56,11 @@ requests across a fleet, with components sized for different kinds of work:
   Add serving capacity as more applications and users depend on your data.
 - **Read execution and caching** (the executor and cache fleets) use separately provisioned resources. Executors
   cache table data to reduce repeated reads from object storage.
-- **Indexing and background workers** (the jobs fleet) build indexes, run Functions, and perform maintenance
+- **Indexing and background workers** (the jobs fleet) build indexes and perform maintenance
   outside the query request path. Size this work separately from query serving
   as your data grows.
+  {/* Draft for the Functions release. Replace "build indexes and perform maintenance" above with:
+  build indexes, run [Functions](/management/function), and perform maintenance */}
 - **The [realtime engine](/tables/realtime-engine)** accepts streaming writes in front of the table when it is
   enabled for a table.
 
