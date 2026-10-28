@@ -42,6 +42,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_ignored = "0.1.14"
 serde_json.workspace = true
 sha2 = "0.10"
+sqlparser = { version = "0.62", default-features = false, features = ["std"] }
 termsize = "0.1"
 thiserror = "1"
 tokio = { workspace = true, features = ["full"] }
@@ -52,6 +53,7 @@ unicode-width = "0.2"
 url.workspace = true
 
 [dev-dependencies]
+prost = "0.14"
 rcgen = "0.12"
 tokio-stream = { version = "0.1", features = ["net"] }
 half.workspace = true

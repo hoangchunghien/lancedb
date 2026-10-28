@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright LanceDB Authors
 
-//! End-to-end TLS coverage for the Flight SQL transport.
+//! End-to-end TLS and SQL file-execution coverage for the Flight SQL transport.
 //!
 //! A throwaway CA signs a server certificate for `127.0.0.1`, a real Flight
 //! server serves it over TLS, and the CLI's executor connects with the CA
@@ -14,6 +14,7 @@ use std::pin::Pin;
 use arrow_array::{Int32Array, RecordBatch};
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
+use arrow_flight::sql::{Any, CommandStatementQuery};
 use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo,
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
@@ -23,7 +24,8 @@ use futures::{Stream, TryStreamExt};
 use lancedb_cli::server_config::TlsOptions;
 use lancedb_cli::sql_executor::SdkSqlExecutor as FlightSqlExecutor;
 use lancedb_cli::sql_executor::{SqlQueryExecutor, SqlResult};
-use std::sync::Arc;
+use prost::Message;
+use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
@@ -45,8 +47,17 @@ type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'stati
 
 /// Minimal Flight service: enough for `execute_query` to complete a round trip.
 /// Everything the CLI does not call is left unimplemented on purpose.
-#[derive(Clone)]
-struct StubFlightService;
+#[derive(Clone, Default)]
+struct StubFlightService {
+    queries: Option<Arc<Mutex<Vec<String>>>>,
+}
+
+/// The SDK wraps a Flight SQL command in a ticket's field 2.
+#[derive(Clone, PartialEq, Message)]
+struct CommandTicket {
+    #[prost(bytes = "vec", tag = "2")]
+    command: Vec<u8>,
+}
 
 impl StubFlightService {
     fn batch() -> RecordBatch {
@@ -79,8 +90,17 @@ impl FlightService for StubFlightService {
 
     async fn do_get(
         &self,
-        _request: Request<Ticket>,
+        request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
+        if let Some(queries) = &self.queries {
+            let ticket = CommandTicket::decode(request.into_inner().ticket).unwrap();
+            let command = Any::decode(ticket.command.as_slice())
+                .unwrap()
+                .unpack::<CommandStatementQuery>()
+                .unwrap()
+                .unwrap();
+            queries.lock().unwrap().push(command.query);
+        }
         let batch = Self::batch();
         let stream = FlightDataEncoderBuilder::new()
             .build(futures::stream::once(async move { Ok(batch) }))
@@ -223,7 +243,7 @@ async fn start_server(
         Server::builder()
             .tls_config(tls)
             .unwrap()
-            .add_service(FlightServiceServer::new(StubFlightService))
+            .add_service(FlightServiceServer::new(StubFlightService::default()))
             .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
                 let _ = shutdown_rx.await;
             })
@@ -238,6 +258,153 @@ fn write_pem(dir: &tempfile::TempDir, name: &str, contents: &str) -> String {
     let path = dir.path().join(name);
     std::fs::write(&path, contents).unwrap();
     path.to_str().unwrap().to_string()
+}
+
+/// Exercise argument parsing, file reading, script execution, and SQL transport.
+/// The stub records SQL without executing it against a database.
+async fn run_sql_file(script: &str) -> (std::process::Output, Vec<String>) {
+    let queries = Arc::new(Mutex::new(Vec::new()));
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let sql_endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let service = StubFlightService {
+        queries: Some(queries.clone()),
+    };
+    let sql_server = tokio::spawn(async move {
+        Server::builder()
+            .add_service(FlightServiceServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let http_endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let app =
+        axum::Router::new().fallback(|| async { axum::Json(serde_json::json!({"tables": []})) });
+    let http_server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("script.sql");
+    std::fs::write(&path, script).unwrap();
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_lancedb"))
+        .args(["sql", "--file"])
+        .arg(path)
+        .args([
+            "--sql-server-url",
+            &sql_endpoint,
+            "--http-server-url",
+            &http_endpoint,
+            "--database",
+            "test",
+            "--api-key",
+            "test-key",
+            "--format",
+            "json",
+        ])
+        .env("HOME", dir.path())
+        .env("XDG_DATA_HOME", dir.path().join("data"))
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env_remove("LANCEDB_CA_CERT")
+        .env_remove("LANCEDB_CLIENT_CERT")
+        .env_remove("LANCEDB_CLIENT_KEY")
+        .output()
+        .await
+        .unwrap();
+    sql_server.abort();
+    http_server.abort();
+    let recorded = queries.lock().unwrap().clone();
+    (output, recorded)
+}
+
+#[tokio::test]
+async fn sql_files_preserve_comments_and_quoted_semicolons() {
+    for (script, expected) in [
+        (
+            "SELECT 1 -- documentation; DELETE FROM customers\n;",
+            vec!["SELECT 1 -- documentation; DELETE FROM customers"],
+        ),
+        (
+            "SELECT 1 /* documentation; DELETE FROM customers */; SELECT 2;",
+            vec![
+                "SELECT 1 /* documentation; DELETE FROM customers */",
+                "SELECT 2",
+            ],
+        ),
+        (
+            "/* outer; /* nested; DELETE FROM customers */ still a comment; */ SELECT 3;",
+            vec!["/* outer; /* nested; DELETE FROM customers */ still a comment; */ SELECT 3"],
+        ),
+        (
+            "SELECT 1 /*! ; DELETE FROM customers */;",
+            vec!["SELECT 1 /*! ; DELETE FROM customers */"],
+        ),
+        (
+            r#"SELECT 'it''s; unchanged', "col;""name", `back;``tick`; SELECT 'next'"#,
+            vec![
+                r#"SELECT 'it''s; unchanged', "col;""name", `back;``tick`"#,
+                "SELECT 'next'",
+            ],
+        ),
+        (
+            "SELECT $$text; -- still text$$, $tag$more; /* text */$tag$; SELECT 3;",
+            vec![
+                "SELECT $$text; -- still text$$, $tag$more; /* text */$tag$",
+                "SELECT 3",
+            ],
+        ),
+        (
+            r"SELECT E'it\'s; unchanged'; SELECT 2;",
+            vec![r"SELECT E'it\'s; unchanged'", "SELECT 2"],
+        ),
+        (
+            "SELECT 'text; -- still a string /* not a comment */'; SELECT 2;",
+            vec![
+                "SELECT 'text; -- still a string /* not a comment */'",
+                "SELECT 2",
+            ],
+        ),
+        (
+            "SELECT 'café; 🦀';\r\n-- comment; DELETE FROM customers\r\nSELECT 2; ;",
+            vec![
+                "SELECT 'café; 🦀'",
+                "-- comment; DELETE FROM customers\r\nSELECT 2",
+            ],
+        ),
+        (
+            "; -- documentation; DELETE FROM customers\n; /* comment; SELECT 2 */; ;",
+            vec![],
+        ),
+    ] {
+        let (output, queries) = run_sql_file(script).await;
+        assert!(
+            output.status.success(),
+            "script {script:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(queries, expected, "script: {script:?}");
+    }
+}
+
+#[tokio::test]
+async fn sql_files_with_unterminated_tokens_submit_no_statements() {
+    for script in [
+        "SELECT 1; SELECT 'unterminated; DELETE FROM customers",
+        "SELECT 1; SELECT \"unterminated; DELETE FROM customers",
+        "SELECT 1; SELECT `unterminated; DELETE FROM customers",
+        "SELECT 1; SELECT $tag$unterminated; DELETE FROM customers",
+        "SELECT 1; /* unterminated; DELETE FROM customers",
+    ] {
+        let (output, queries) = run_sql_file(script).await;
+        assert!(!output.status.success(), "script: {script:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("Failed to tokenize SQL script"),
+            "unexpected error: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            queries.is_empty(),
+            "submitted SQL for {script:?}: {queries:?}"
+        );
+    }
 }
 
 #[tokio::test]

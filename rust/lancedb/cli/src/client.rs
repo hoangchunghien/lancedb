@@ -8,7 +8,7 @@ use crate::server_config::{
 };
 use crate::sql_executor::SdkSqlExecutor;
 use crate::sql_executor::{SqlQueryExecutor, SqlResult};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use arrow_schema::Schema;
 use directories::ProjectDirs;
 use futures::TryStreamExt;
@@ -19,6 +19,8 @@ use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
 use rustyline::{Editor, Helper};
+use sqlparser::dialect::{Dialect, GenericDialect};
+use sqlparser::tokenizer::{Location, Token, Tokenizer};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -1638,14 +1640,98 @@ pub async fn run_client_command_with_writer(
     Ok(())
 }
 
+/// SQL lexical rules for scripts. Comments, including MySQL-style hints, must
+/// remain comments when deciding which statements to submit independently.
+#[derive(Debug, Default)]
+struct ScriptDialect(GenericDialect);
+
+impl Dialect for ScriptDialect {
+    fn dialect(&self) -> std::any::TypeId {
+        self.0.dialect()
+    }
+
+    fn is_identifier_start(&self, ch: char) -> bool {
+        self.0.is_identifier_start(ch)
+    }
+
+    fn is_identifier_part(&self, ch: char) -> bool {
+        self.0.is_identifier_part(ch)
+    }
+
+    fn is_delimited_identifier_start(&self, ch: char) -> bool {
+        self.0.is_delimited_identifier_start(ch)
+    }
+
+    fn supports_nested_comments(&self) -> bool {
+        true
+    }
+
+    fn supports_multiline_comment_hints(&self) -> bool {
+        false
+    }
+
+    fn supports_string_escape_constant(&self) -> bool {
+        true
+    }
+
+    fn supports_unicode_string_literal(&self) -> bool {
+        true
+    }
+}
+
+/// Split only on SQL delimiter tokens, retaining the original spelling of each
+/// statement. Tokenize the whole script before executing any of its statements.
+fn split_sql_script(script: &str) -> Result<Vec<&str>> {
+    let tokens = Tokenizer::new(&ScriptDialect::default(), script)
+        .tokenize_with_location()
+        .context("Failed to tokenize SQL script")?;
+    // Token locations count characters rather than bytes. Walk the source once
+    // to translate delimiter locations without changing Unicode or line endings.
+    let mut offsets = script
+        .char_indices()
+        .scan(Location::new(1, 1), |location, (offset, ch)| {
+            let start = *location;
+            if ch == '\n' {
+                location.line += 1;
+                location.column = 1;
+            } else {
+                location.column += 1;
+            }
+            Some((start, offset))
+        });
+    let mut commands = Vec::new();
+    let mut start = 0;
+    let mut has_statement = false;
+    for token in tokens {
+        match token.token {
+            Token::SemiColon => {
+                let (_, end) = offsets
+                    .find(|(location, _)| *location == token.span.start)
+                    .context("SQL delimiter location is outside the script")?;
+                if has_statement {
+                    commands.push(script[start..end].trim());
+                }
+                start = end + 1;
+                has_statement = false;
+            }
+            Token::Whitespace(_) => {}
+            _ => has_statement = true,
+        }
+    }
+    if has_statement {
+        commands.push(script[start..].trim());
+    }
+    Ok(commands)
+}
+
 pub async fn run_client_script_with_writer(
     conn: &ResolvedConnection,
     script: String,
     format: String,
     writer: Option<Box<dyn std::io::Write + Send + 'static>>,
 ) -> anyhow::Result<()> {
-    // Process script as multiple commands
     let _ = writer;
+    let commands = split_sql_script(&script)?;
 
     let output_format = format.parse::<OutputFormat>()?;
 
@@ -1666,13 +1752,6 @@ pub async fn run_client_script_with_writer(
     if !conn.sql_server_url.is_empty() {
         client.connect(conn).await?;
     }
-
-    // Split script into commands by semicolon
-    let commands: Vec<&str> = script
-        .split(';')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect();
 
     for command in commands {
         if command.starts_with('\\') {
