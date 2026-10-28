@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright LanceDB Authors
+// SPDX-FileCopyrightText: Copyright The LanceDB Authors
 
 //! End-to-end TLS and SQL file-execution coverage for the Flight SQL transport.
 //!
