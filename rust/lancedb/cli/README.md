@@ -9,7 +9,10 @@ Build and install from the LanceDB repository root:
 cargo install --locked --path rust/lancedb/cli
 ```
 
-The executable is `lancedb`. Running it without arguments prints help.
+The executable is `lancedb`. Running it without a subcommand opens the SQL shell.
+Use `lancedb --help` to list commands. SQL options work with or without the `sql`
+subcommand and stay scoped to SQL. Other commands accept their own options after
+the subcommand; root SQL options cannot be combined with another subcommand.
 
 ```sh
 lancedb profile create production \
@@ -17,8 +20,9 @@ lancedb profile create production \
   --sql-server-url grpcs://sql.example.com:10025 \
   --database analytics
 lancedb auth login --profile production
+lancedb --profile production
 lancedb sql --profile production
-lancedb sql --profile production --command 'SELECT 1' --format json
+lancedb --profile production --command 'SELECT 1' --format json
 lancedb sql --profile production --file queries.sql
 lancedb sql --profile production --command 'SHOW JOBS'
 lancedb sql --profile production --command "SHOW ERRORS ON documents FOR JOB 'JOB_ID'"
@@ -51,8 +55,7 @@ Job access remains subject to the deployment's authorization rules.
 
 The SQL command connects to the server's Flight SQL API.
 The CLI uses the Rust SDK for SQL and ACLs. The Enterprise executable shares the client
-library while retaining its runtime/admin commands and legacy SQL
-entry points (`lancedb`, `lancedb --command`, and `lancedb --file`). Both executables
+library while retaining its runtime/admin commands. Both executables
 have the same name: installing one replaces the other in that installation path.
 
 ## Development

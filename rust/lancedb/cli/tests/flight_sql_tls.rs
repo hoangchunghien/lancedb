@@ -262,7 +262,7 @@ fn write_pem(dir: &tempfile::TempDir, name: &str, contents: &str) -> String {
 
 /// Exercise argument parsing, file reading, script execution, and SQL transport.
 /// The stub records SQL without executing it against a database.
-async fn run_sql_file(script: &str) -> (std::process::Output, Vec<String>) {
+async fn run_sql_cli(args: &[&str], script: Option<&str>) -> (std::process::Output, Vec<String>) {
     let queries = Arc::new(Mutex::new(Vec::new()));
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let sql_endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -284,25 +284,34 @@ async fn run_sql_file(script: &str) -> (std::process::Output, Vec<String>) {
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("script.sql");
-    std::fs::write(&path, script).unwrap();
+    if let Some(script) = script {
+        std::fs::write(&path, script).unwrap();
+    }
+    let mut config = lancedb_cli::server_config::Config::default();
+    config.set_profile(
+        "test",
+        lancedb_cli::server_config::Profile {
+            sql_server_url: Some(sql_endpoint),
+            http_server_url: Some(http_endpoint),
+            database: Some("test".into()),
+            api_key: Some("test-key".into()),
+            ..Default::default()
+        },
+    );
+    config.set_default_profile("test");
+    config
+        .save_to_path(&dir.path().join(".lancedb/config.toml"))
+        .unwrap();
     let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_lancedb"))
-        .args(["sql", "--file"])
-        .arg(path)
-        .args([
-            "--sql-server-url",
-            &sql_endpoint,
-            "--http-server-url",
-            &http_endpoint,
-            "--database",
-            "test",
-            "--api-key",
-            "test-key",
-            "--format",
-            "json",
-        ])
+        .args(args)
+        .current_dir(dir.path())
+        .stdin(std::process::Stdio::null())
         .env("HOME", dir.path())
         .env("XDG_DATA_HOME", dir.path().join("data"))
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env_remove("LANCEDB_API_KEY")
+        .env_remove("LANCEDB_OIDC_ACCESS_TOKEN")
+        .env_remove("LANCEDB_OIDC_ACCESS_TOKEN_FILE")
         .env_remove("LANCEDB_CA_CERT")
         .env_remove("LANCEDB_CLIENT_CERT")
         .env_remove("LANCEDB_CLIENT_KEY")
@@ -313,6 +322,60 @@ async fn run_sql_file(script: &str) -> (std::process::Output, Vec<String>) {
     http_server.abort();
     let recorded = queries.lock().unwrap().clone();
     (output, recorded)
+}
+
+async fn run_sql_file(script: &str) -> (std::process::Output, Vec<String>) {
+    run_sql_cli(
+        &["sql", "--file", "script.sql", "--format", "json"],
+        Some(script),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn no_subcommand_opens_the_sql_shell() {
+    for args in [vec![], vec!["sql"]] {
+        let (output, queries) = run_sql_cli(&args, None).await;
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("LanceDB CLI v"), "{stdout}");
+        assert!(
+            stdout.contains("Type \\? for help or \\q to quit"),
+            "{stdout}"
+        );
+        assert!(queries.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn sql_options_work_with_and_without_the_subcommand() {
+    for prefix in [vec![], vec!["sql"]] {
+        let mut args = prefix.clone();
+        args.extend(["--command", "SELECT 42", "--format", "json"]);
+        let (output, queries) = run_sql_cli(&args, None).await;
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(queries, ["SELECT 42"]);
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value, serde_json::json!([{"answer": ANSWER}]));
+
+        let mut args = prefix;
+        args.extend(["--file", "script.sql", "--format", "json"]);
+        let (output, queries) = run_sql_cli(&args, Some("SELECT 'semi;colon';")).await;
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(queries, ["SELECT 'semi;colon'"]);
+    }
 }
 
 #[tokio::test]

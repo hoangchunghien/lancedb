@@ -4,9 +4,10 @@
 use std::process::Command;
 
 #[test]
-fn no_arguments_print_help_without_creating_configuration() {
+fn help_lists_commands_without_creating_configuration() {
     let home = tempfile::tempdir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_lancedb"))
+        .arg("--help")
         .env("HOME", home.path())
         .env("LANCEDB_API_KEY", "secret-that-must-not-appear")
         .output()
@@ -22,15 +23,17 @@ fn no_arguments_print_help_without_creating_configuration() {
 }
 
 #[test]
-fn excluded_commands_and_legacy_sql_flags_are_rejected() {
+fn excluded_commands_and_mixed_sql_options_are_rejected() {
     for args in [
         vec!["server"],
         vec!["management"],
         vec!["job", "--help"],
         vec!["job", "list", "--help"],
         vec!["job", "usage"],
-        vec!["--command", "SELECT 1"],
-        vec!["--file", "queries.sql"],
+        vec!["--command", "SELECT 1", "profile", "list"],
+        vec!["--file", "queries.sql", "profile", "list"],
+        vec!["profile", "list", "--command", "SELECT 1"],
+        vec!["profile", "list", "--file", "queries.sql"],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_lancedb"))
             .args(args)
@@ -38,6 +41,39 @@ fn excluded_commands_and_legacy_sql_flags_are_rejected() {
             .unwrap();
         assert!(!output.status.success());
     }
+}
+
+#[test]
+fn sql_options_do_not_appear_in_other_subcommand_help() {
+    let output = Command::new(env!("CARGO_BIN_EXE_lancedb"))
+        .args(["profile", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for option in ["--command", "--file", "--format", "--sql-server-url"] {
+        assert!(!stdout.contains(option), "{stdout}");
+    }
+}
+
+#[test]
+fn sql_environment_options_do_not_change_profile_commands() {
+    let home = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_lancedb"))
+        .args(["profile", "list"])
+        .env("HOME", home.path())
+        .env("LANCEDB_CA_CERT", "/not-used-by-profile/ca.pem")
+        .env("LANCEDB_CLIENT_CERT", "/not-used-by-profile/client.pem")
+        .env("LANCEDB_CLIENT_KEY", "/not-used-by-profile/key.pem")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Configured profiles:"), "{stdout}");
 }
 
 #[test]
