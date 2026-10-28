@@ -25,20 +25,20 @@ use super::DataSource;
 ///
 /// HuggingFace datasets use various naming conventions for parquet files:
 /// - `data/train-00000.parquet` (data/{split}-*)
+/// - `plain_text/train-00000.parquet` ({configuration}/{split}-*)
 /// - `train/data.parquet` ({split}/*)
 /// - `train-00000.parquet` ({split}-*)
 /// - `some/path/train/file.parquet` (*/{split}/*)
-/// - `train.parquet` ({split}.parquet)
+/// - `some/path/train.parquet` (*/{split}.parquet)
 fn matches_split(filename: &str, split: &str) -> bool {
-    let prefixes = [
-        format!("data/{}-", split),
-        format!("{}/", split),
-        format!("{}-", split),
-    ];
-
-    prefixes.iter().any(|p| filename.starts_with(p))
-        || filename.contains(&format!("/{}/", split))
-        || filename == format!("{}.parquet", split)
+    if split.is_empty() {
+        return false;
+    }
+    let (parent, basename) = filename.rsplit_once('/').unwrap_or(("", filename));
+    parent.split('/').any(|component| component == split)
+        || basename
+            .strip_prefix(split)
+            .is_some_and(|suffix| suffix == ".parquet" || suffix.starts_with('-'))
 }
 
 /// Data source for HuggingFace datasets.
@@ -55,6 +55,7 @@ pub struct HuggingFaceSource {
 
 impl HuggingFaceSource {
     /// Create a new HuggingFace data source.
+    /// Discovery fails if no Parquet paths identify the requested split.
     pub fn new(dataset_id: String, split: String) -> Result<Self> {
         Ok(Self {
             dataset_id,
@@ -87,7 +88,8 @@ impl HuggingFaceSource {
         Ok(downloaded)
     }
 
-    /// Discover parquet files for the specified split.
+    /// Discover parquet files for the specified split. Return an error if the
+    /// requested split cannot be identified; unrelated files must not be imported.
     async fn discover_parquet_files(
         &self,
         repo_api: &hf_hub::api::tokio::ApiRepo,
@@ -116,7 +118,6 @@ impl HuggingFaceSource {
             return Ok(split_files);
         }
 
-        // Fall back to all parquet files if split-specific ones aren't found
         let all_parquet: Vec<_> = files
             .siblings
             .iter()
@@ -136,12 +137,13 @@ impl HuggingFaceSource {
             );
         }
 
-        info!(
-            "No files found for split '{}', using all {} parquet files",
+        anyhow::bail!(
+            "No parquet files found for requested split '{}' in dataset {}. \
+             Available parquet files: {:?}",
             self.split,
-            all_parquet.len()
-        );
-        Ok(all_parquet)
+            self.dataset_id,
+            all_parquet
+        )
     }
 
     /// Download the specified files from the repository.
@@ -260,14 +262,87 @@ mod tests {
     use super::*;
     use futures::TryStreamExt;
 
+    #[test]
+    fn split_matching_respects_path_and_name_boundaries() {
+        for filename in [
+            "data/train-00000.parquet",
+            "plain_text/train-00000-of-00001.parquet",
+            "some/configuration/data/train-00000.parquet",
+            "train/data.parquet",
+            "train-00000.parquet",
+            "some/path/train/file.parquet",
+            "train.parquet",
+            "plain_text/train.parquet",
+        ] {
+            assert!(matches_split(filename, "train"), "{filename}");
+        }
+        for filename in [
+            "plain_text/test-00000-of-00001.parquet",
+            "plain_text/unsupervised-00000-of-00001.parquet",
+            "plain_text/training-00000.parquet",
+            "plain_text/pretrain-00000.parquet",
+            "plain_text/train_extra.parquet",
+            "training/file.parquet",
+            "train-configuration/test-00000.parquet",
+            "data/part-00000.parquet",
+        ] {
+            assert!(!matches_split(filename, "train"), "{filename}");
+        }
+        assert!(!matches_split("train.parquet", ""));
+    }
+
     #[tokio::test]
-    async fn discovers_requested_split_and_streams_cached_parquet() {
+    async fn unmatched_split_is_an_error() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let app = axum::Router::new().fallback(|| async {
             axum::Json(serde_json::json!({"sha":"fixture", "siblings":[
-                {"rfilename":"README.md"}, {"rfilename":"data/test-00000.parquet"},
-                {"rfilename":"data/train-00000.parquet"}
+                {"rfilename":"README.md"},
+                {"rfilename":"plain_text/test-00000.parquet"},
+                {"rfilename":"plain_text/unsupervised-00000.parquet"},
+                {"rfilename":"data/part-00000.parquet"}
+            ]}))
+        });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let api = hf_hub::api::tokio::ApiBuilder::new()
+            .with_endpoint(endpoint)
+            .with_cache_dir(dir.path().join("cache"))
+            .with_token(None)
+            .build()
+            .unwrap();
+        let repo = api.repo(Repo::dataset("org/dataset".into()));
+        for split in ["train", "typo", ""] {
+            let source = HuggingFaceSource::new("org/dataset".into(), split.into()).unwrap();
+            let error = source.discover_parquet_files(&repo).await.unwrap_err();
+            let message = error.to_string();
+            assert!(
+                message.contains(&format!("requested split '{split}'")),
+                "{message}"
+            );
+            assert!(message.contains("org/dataset"), "{message}");
+            assert!(
+                message.contains("plain_text/test-00000.parquet"),
+                "{message}"
+            );
+            assert!(message.contains("data/part-00000.parquet"), "{message}");
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn discovers_configuration_prefixed_split_and_streams_cached_parquet() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().fallback(|| async {
+            axum::Json(serde_json::json!({"sha":"fixture", "siblings":[
+                {"rfilename":"README.md"},
+                {"rfilename":"plain_text/test-00000-of-00001.parquet"},
+                {"rfilename":"plain_text/train-00000-of-00002.parquet"},
+                {"rfilename":"plain_text/unsupervised-00000-of-00001.parquet"},
+                {"rfilename":"plain_text/train-00001-of-00002.parquet"},
+                {"rfilename":"plain_text/training-00000.parquet"},
+                {"rfilename":"plain_text/train-not-parquet.txt"}
             ]}))
         });
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -284,7 +359,10 @@ mod tests {
                 .discover_parquet_files(&api.repo(Repo::dataset("org/dataset".into())))
                 .await
                 .unwrap(),
-            ["data/train-00000.parquet"]
+            [
+                "plain_text/train-00000-of-00002.parquet",
+                "plain_text/train-00001-of-00002.parquet"
+            ]
         );
         server.abort();
 
