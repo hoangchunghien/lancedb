@@ -13,7 +13,7 @@ path = "src/main.rs"
 [dependencies]
 tempfile.workspace = true
 which = "6"
-anyhow = "1"
+anyhow.workspace = true
 arrow-array.workspace = true
 arrow-buffer.workspace = true
 arrow-cast.workspace = true
@@ -27,12 +27,12 @@ async-trait.workspace = true
 clap = { version = "4.5.13", features = ["derive", "env"] }
 directories = "5"
 futures.workspace = true
-http = "1"
+http.workspace = true
 indicatif = "0.17"
 lance = { workspace = true, features = ["aws", "gcp", "azure"] }
 lance-namespace.workspace = true
 lancedb = { workspace = true, features = ["remote", "aws", "gcs", "azure"] }
-hf-hub = { version = "0.4", features = ["tokio"] }
+hf-hub = { workspace = true, default-features = true, features = ["tokio"] }
 pager = "0.16"
 parquet = { version = "58.0.0", features = ["async"] }
 rustyline = "14"
@@ -40,25 +40,25 @@ rustls = { version = "0.23", features = ["ring"] }
 serde = { workspace = true, features = ["derive"] }
 serde_ignored = "0.1.14"
 serde_json.workspace = true
-sha2 = "0.10"
+sha2.workspace = true
 sqlparser = { version = "0.62", default-features = false, features = ["std"] }
 termsize = "0.1"
 thiserror = "1"
 tokio = { workspace = true, features = ["full"] }
 toml = "0.8"
 tonic.workspace = true
-tracing = "0.1"
+tracing.workspace = true
 unicode-width = "0.2"
 url.workspace = true
 
 [dev-dependencies]
-prost = "0.14"
+prost.workspace = true
 rcgen = "0.12"
 tokio-stream = { version = "0.1", features = ["net"] }
 half.workspace = true
 axum = "0.8"
-base64 = "0.22"
+base64.workspace = true
 csv = "1"
 reqwest = { version = "0.12", features = ["json"] }
-serial_test = "3"
+serial_test.workspace = true
 tempfile.workspace = true
