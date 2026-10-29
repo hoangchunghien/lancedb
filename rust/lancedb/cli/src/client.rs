@@ -1938,7 +1938,7 @@ mod tests {
         assert_eq!(row_count(&result), over);
         assert!(notice.is_none());
 
-        for format in [OutputFormat::Json, OutputFormat::NdJson, OutputFormat::Csv] {
+        for format in [OutputFormat::Json, OutputFormat::Ndjson, OutputFormat::Csv] {
             let output = ResultFormatter::new(format)
                 .format(&QueryResult::SqlResult(jobs(over)))
                 .unwrap();

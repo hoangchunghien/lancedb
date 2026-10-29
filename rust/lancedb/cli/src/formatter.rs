@@ -46,7 +46,7 @@ pub enum OutputFormat {
     Table,
     Csv,
     Json,
-    NdJson,
+    Ndjson,
 }
 
 impl FromStr for OutputFormat {
@@ -57,7 +57,7 @@ impl FromStr for OutputFormat {
             "table" => Ok(Self::Table),
             "csv" => Ok(Self::Csv),
             "json" => Ok(Self::Json),
-            "ndjson" => Ok(Self::NdJson),
+            "ndjson" => Ok(Self::Ndjson),
             _ => Err(anyhow::anyhow!(
                 "Invalid output format: {}. Must be one of: table, csv, json, ndjson",
                 s
@@ -152,7 +152,7 @@ impl ResultFormatter {
             OutputFormat::Table => self.format_batches_as_table(batches, writer),
             OutputFormat::Csv => self.format_batches_as_csv(batches, writer),
             OutputFormat::Json => self.format_batches_as_json(batches, writer),
-            OutputFormat::NdJson => self.format_batches_as_ndjson(batches, writer),
+            OutputFormat::Ndjson => self.format_batches_as_ndjson(batches, writer),
         }
     }
 
@@ -654,7 +654,7 @@ impl ResultFormatter {
                 let json_string = serde_json::to_string_pretty(&json)?;
                 writeln!(writer, "{}", json_string)?;
             }
-            OutputFormat::NdJson => {
+            OutputFormat::Ndjson => {
                 // NDJSON: one line for table info, one line per index
                 let table_json = serde_json::json!({
                     "type": "table_info",
@@ -1553,7 +1553,7 @@ mod tests {
 
     #[test]
     fn test_ndjson_format() {
-        let formatter = ResultFormatter::new(OutputFormat::NdJson);
+        let formatter = ResultFormatter::new(OutputFormat::Ndjson);
         let batch = create_test_batch();
         let result = QueryResult::SqlResult(SqlResult::Query(vec![batch]));
 
@@ -2328,10 +2328,10 @@ Size: 2.0 MB
     }
 
     #[test]
-    fn test_string_ellision() {
+    fn test_string_elision() {
         let formatter = ResultFormatter::new(OutputFormat::Table);
 
-        // Create a long string that should be ellided
+        // Create a long string that should be elided
         let long_string = "a".repeat(100);
         let short_string = "short string";
 
